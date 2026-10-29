@@ -1,0 +1,12 @@
+name: iso_slam_v4
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - isoquant=3.13.0
+  - sqanti3=6.0.1
+  - suppa=2.4
+  - pysam
+  - scipy
+  - numpy

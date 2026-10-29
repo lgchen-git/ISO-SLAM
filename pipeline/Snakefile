@@ -1,0 +1,367 @@
+import csv
+import shlex
+from pathlib import Path
+
+with open(config['samples_tsv'], newline='') as handle:
+    SAMPLES = {row['sample_id']: row for row in csv.DictReader(handle, delimiter='\t')}
+if not SAMPLES:
+    raise ValueError('Sample sheet is empty')
+OUT = config['results_root'].rstrip('/')
+LOG = config['log_root'].rstrip('/')
+TMP = config['tmp_root'].rstrip('/')
+CUSTOMER_DELIVERY = config.get('delivery_root', f'{OUT}/_project/10_delivery/ISO_SLAM_Delivery').rstrip('/')
+SAMPLE_SHEET = config['samples_tsv']
+PY = config['python_bin']
+CONFIG = workflow.configfiles[-1]
+TASK = 'pipeline/scripts/snakemake_tasks.py'
+container: "docker://iso-slam:20260930-v1.0.0"
+
+wildcard_constraints:
+    sample='|'.join(__import__('re').escape(sample) for sample in SAMPLES)
+
+HELPERS = {'raw_qc': ['lr_longread_fastq_qc.py'], 'trim': ['lr_bulk_trim_reads.py'], 'alignment': ['lr_align_reads.py'], 'strand_audit': ['audit_lr_library_strand.py', 'lr_gene_assignment.py'], 'strand_selection': [], 'grand3_reference': [], 'read_calling': ['lr_call_bulk_slam.py', 'lr_gene_assignment.py'], 'isoform_catalog': ['run_isoform_catalog.py', 'iso_slam_v4_common.py'], 'slam_model': ['run_grand3_sample.py', 'iso_slam_v4_common.py'], 'isoform_dynamics': ['build_isoform_dynamics.py'], 'sample_report': ['build_lr_iso_slam_report_v4.py', 'build_lr_iso_slam_read_flow.py', 'report_components.py', '00_shared/validate_bio_report.py'], 'project_qc': ['build_lr_iso_slam_project_qc_v4.py'], 'group_analysis': ['run_iso_slam_group_analysis.R'], 'new_rna_splicing': ['run_new_rna_splicing.py', 'run_new_rna_splicing.R'], 'project_report': ['build_lr_iso_slam_project_report_v4.py', 'report_components.py', '00_shared/validate_bio_report.py'], 'delivery': ['00_shared/validate_bio_report.py'], 'customer_delivery': ['10_delivery/build_iso_slam_delivery_package.py', 'gene_annotation.py', 'iso_slam_v4_common.py']}
+SETTINGS = {'raw_qc': ['longread_qc_max_reads', 'enable_nanoplot_qc'], 'trim': ['primer_5p', 'adapter_3p', 'adapter_seed_len', 'adapter_search_window', 'adapter_min_overlap', 'min_insert_len'], 'alignment': ['min_mapq', 'mmi', 'junc_bed'], 'read_calling': ['min_mapq', 'min_tc_baseq', 'min_t_covered', 'min_site_depth', 'min_site_tc_count', 'min_site_tc_rate', 'max_site_other_mismatch_rate', 'max_read_other_mismatch_rate', 'alpha', 'main_call', 'assignment_mode'], 'isoform_catalog': ['isoquant_full_length', 'isoquant_complete_genedb', 'isoquant_data_type'], 'isoform_dynamics': ['posterior_new_threshold', 'posterior_old_threshold', 'posterior_bootstrap_iterations', 'posterior_bootstrap_seed', 'grand_slam_ntr_mae_max'], 'sample_report': ['report_title', 'control_group', 'labeling_design'], 'group_analysis': ['control_group', 'differential_contrasts', 'biological_replicates_per_group'], 'new_rna_splicing': ['differential_contrasts', 'suppa_bin', 'rscript_bin'], 'project_report': ['qc_review_min_raw_reads', 'qc_review_min_fastq_q20_fraction', 'qc_review_min_primary_mapq20_fraction', 'qc_review_min_detected_genes'], 'delivery': ['report_schema'], 'customer_delivery': ['delivery_root', 'delivery_name', 'include_sample_reports']}
+
+CONTRASTS = config.get('differential_contrasts') or [
+    {'treatment': config['treatment_group'], 'control': config['control_group']}
+]
+CONTRAST_NAMES = [f"{item['treatment']}_vs_{item['control']}" for item in CONTRASTS]
+DIFFERENTIAL_LAYERS = ['gene_abundance', 'gene_labeling', 'isoform_abundance', 'total_isoform_usage', 'new_isoform_usage']
+GROUP_ROOT = f'{OUT}/_project/08_project_qc/02_group_analysis'
+SAMPLE_GENE_NAME_VALIDATION = f'{OUT}/_project/08_project_qc/05_metadata/sample_gene_name_annotation.json'
+AS_GENE_NAME_VALIDATION = f'{GROUP_ROOT}/tables/differential/new_rna_splicing/gene_name_annotation.json'
+SAMPLE_GENE_TABLES = [
+    f'{OUT}/{{sample}}/04_isoform_catalog/01_tables/{{sample}}.isoform_catalog.tsv',
+    f'{OUT}/{{sample}}/05_slam_model/01_tables/{{sample}}.grand3_gene_ntr.tsv',
+    f'{OUT}/{{sample}}/06_isoform_dynamics/01_tables/{{sample}}.gene_dynamics.tsv',
+    f'{OUT}/{{sample}}/06_isoform_dynamics/01_tables/{{sample}}.isoform_dynamics.tsv',
+    f'{OUT}/{{sample}}/06_isoform_dynamics/01_tables/{{sample}}.isoform_switch_candidates.tsv',
+]
+GROUP_ARTIFACTS = [f'{GROUP_ROOT}/tables/{name}' for name in (
+    'contrast_summary.tsv', 'gene_annotation.tsv', 'sample_gene_abundance_correlations.tsv',
+    'sample_labeling_signal.tsv', 'sample_pca_scores.tsv', 'within_group_signal_summary.tsv',
+)]
+GROUP_ARTIFACTS += [f'{GROUP_ROOT}/figures/{name}.{ext}' for name in (
+    'differential_feature_counts', 'gene_abundance_correlation', 'gene_abundance_pca', 'within_group_labeling_signal',
+) for ext in ('png', 'pdf')]
+for contrast in CONTRAST_NAMES:
+    for layer in DIFFERENTIAL_LAYERS:
+        GROUP_ARTIFACTS.append(f'{GROUP_ROOT}/tables/differential/{contrast}/{layer}.tsv')
+        GROUP_ARTIFACTS.extend(f'{GROUP_ROOT}/figures/differential/{contrast}/{layer}_{kind}.{ext}'
+                               for kind, ext in [('heatmap', 'png'), ('heatmap', 'pdf'), ('heatmap_data', 'tsv'), ('volcano', 'png'), ('volcano', 'pdf')])
+
+def code_for(task):
+    inputs = [TASK, SAMPLE_SHEET] + ["pipeline/scripts/" + name for name in HELPERS[task]]
+    if task == 'customer_delivery':
+        inputs.append('docs/result_review_criteria.md')
+        inputs += [
+            'pipeline/scripts/10_delivery/build_iso_slam_as_supplement.py',
+            'pipeline/scripts/10_delivery/plot_iso_slam_as_supplement.R',
+        ]
+    if task == 'sample_report':
+        inputs += [
+            'pipeline/scripts/build_read_flow_sankey.py',
+            'pipeline/scripts/validate_read_flow_outputs.py',
+            'pipeline/assets/plotly-3.5.1.min.js',
+        ]
+    return inputs
+
+def settings_for(task):
+    values = {key: config.get(key) for key in SETTINGS.get(task, [])}
+    if task == 'customer_delivery':
+        values['rscript_bin'] = config.get('rscript_bin')
+    return values
+
+def stage(sample, name):
+    return f'{OUT}/{sample}/{name}'
+
+rule all:
+    input:
+        f'{OUT}/_project/RUN_COMPLETE.tsv',
+        f'{CUSTOMER_DELIVERY}/DELIVERY_VALIDATION.json'
+
+rule raw_qc:
+    input:
+        lambda w: SAMPLES[w.sample]['fastq'],
+        code=code_for("raw_qc")
+    output: f'{OUT}/{{sample}}/01_raw_qc/04_tool_output/longread_qc/fastq/{{sample}}.raw_fastq_qc.json'
+    params: settings=settings_for("raw_qc")
+    log: f'{LOG}/{{sample}}/01_raw_qc.log'
+    benchmark: f'{LOG}/{{sample}}/01_raw_qc.benchmark.tsv'
+    threads: 1
+    resources: mem_mb=4096, sample_slots=1
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task raw_qc --sample {wildcards.sample:q} --threads {threads} > {log:q} 2>&1'
+
+rule trim:
+    input:
+        lambda w: SAMPLES[w.sample]['fastq'],
+        code=code_for("trim")
+    output:
+        reads=f'{OUT}/{{sample}}/02_trim/04_tool_output/trim/{{sample}}.insert.fastq.gz',
+        summary=f'{OUT}/{{sample}}/02_trim/04_tool_output/trim/{{sample}}.trim_summary.json'
+    params: settings=settings_for("trim")
+    log: f'{LOG}/{{sample}}/02_trim.log'
+    benchmark: f'{LOG}/{{sample}}/02_trim.benchmark.tsv'
+    threads: 1
+    resources: mem_mb=4096, sample_slots=1
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task trim --sample {wildcards.sample:q} --threads {threads} > {log:q} 2>&1'
+
+rule alignment:
+    input:
+        reads=rules.trim.output.reads,
+        reference=config.get('mmi') or config['genome_fa'],
+        gtf=config['gtf'],
+        code=code_for("alignment")
+    output:
+        sorted=f'{OUT}/{{sample}}/03_alignment/04_tool_output/minimap2_samtools/{{sample}}.sorted.bam',
+        primary=f'{OUT}/{{sample}}/03_alignment/04_tool_output/minimap2_samtools/{{sample}}.primary.q20.bam',
+        index=f'{OUT}/{{sample}}/03_alignment/04_tool_output/minimap2_samtools/{{sample}}.primary.q20.bam.bai',
+        flagstat=f'{OUT}/{{sample}}/03_alignment/04_tool_output/minimap2_samtools/{{sample}}.flagstat.txt',
+        primary_flagstat=f'{OUT}/{{sample}}/03_alignment/04_tool_output/minimap2_samtools/{{sample}}.primary.flagstat.txt'
+    params: settings=settings_for("alignment")
+    log: f'{LOG}/{{sample}}/03_alignment.log'
+    benchmark: f'{LOG}/{{sample}}/03_alignment.benchmark.tsv'
+    threads: int(config.get('threads', 8))
+    resources: mem_mb=32768, sample_slots=1
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task alignment --sample {wildcards.sample:q} --threads {threads} > {log:q} 2>&1'
+
+rule strand_audit:
+    input:
+        bam=rules.alignment.output.primary, gtf=config['gtf'],
+        code=code_for("strand_audit")
+    output: f'{TMP}/{{sample}}/strand/{{sample}}.strand_orientation_audit.json'
+    params: settings=settings_for("strand_audit")
+    log: f'{LOG}/{{sample}}/strand_audit.log'
+    threads: 1
+    resources: mem_mb=4096, sample_slots=1
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task strand_audit --sample {wildcards.sample:q} --threads {threads} > {log:q} 2>&1'
+
+rule strand_selection:
+    input:
+        expand(f'{TMP}/{{sample}}/strand/{{sample}}.strand_orientation_audit.json', sample=SAMPLES),
+        code=code_for("strand_selection")
+    output: f'{TMP}/strand/selected_mode.json'
+    params: settings=settings_for("strand_selection")
+    log: f'{LOG}/strand_selection.log'
+    threads: 1
+    resources: mem_mb=1024
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task strand_selection > {log:q} 2>&1'
+
+rule grand3_reference:
+    input:
+        fasta=config['genome_fa'], gtf=config['gtf'],
+        code=code_for("grand3_reference")
+    output: config['grand_slam_genomic']
+    params: settings=settings_for("grand3_reference")
+    log: f'{LOG}/grand3_reference.log'
+    benchmark: f'{LOG}/grand3_reference.benchmark.tsv'
+    threads: 1
+    resources: mem_mb=24576, sample_slots=1
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task grand3_reference > {log:q} 2>&1'
+
+rule read_calling:
+    input:
+        bam=rules.alignment.output.primary,
+        strand=rules.strand_selection.output,
+        fasta=config['genome_fa'], gtf=config['gtf'],
+        code=code_for("read_calling")
+    output:
+        calls=f'{OUT}/{{sample}}/05_slam_model/04_tool_output/caller/{{sample}}.bulk_read_calls.tsv.gz',
+        qc=f'{OUT}/{{sample}}/05_slam_model/04_tool_output/caller/{{sample}}.bulk_slam_qc.json',
+        substitutions=f'{OUT}/{{sample}}/05_slam_model/04_tool_output/caller/{{sample}}.substitution_summary.tsv'
+    params: settings=settings_for("read_calling")
+    log: f'{LOG}/{{sample}}/read_calling.log'
+    benchmark: f'{LOG}/{{sample}}/read_calling.benchmark.tsv'
+    threads: 1
+    resources: mem_mb=32768, sample_slots=1
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task read_calling --sample {wildcards.sample:q} > {log:q} 2>&1'
+
+rule isoform_catalog:
+    input:
+        bam=rules.alignment.output.primary,
+        reads=rules.trim.output.reads,
+        fasta=config['genome_fa'], gtf=config['gtf'],
+        code=code_for("isoform_catalog")
+    output:
+        catalog=f'{OUT}/{{sample}}/04_isoform_catalog/01_tables/{{sample}}.isoform_catalog.tsv',
+        assignments=f'{OUT}/{{sample}}/04_isoform_catalog/01_tables/{{sample}}.read_isoform_assignments.tsv.gz',
+        filtered=f'{OUT}/{{sample}}/04_isoform_catalog/04_tool_output/filtered/{{sample}}.filtered_isoforms.gtf',
+        validation=f'{OUT}/{{sample}}/04_isoform_catalog/05_metadata/catalog_validation.json'
+    params: settings=settings_for("isoform_catalog")
+    log: f'{LOG}/{{sample}}/04_isoform_catalog.log'
+    benchmark: f'{LOG}/{{sample}}/04_isoform_catalog.benchmark.tsv'
+    threads: int(config.get('threads', 8))
+    resources: mem_mb=47104, sample_slots=1
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task isoform_catalog --sample {wildcards.sample:q} --threads {threads} > {log:q} 2>&1'
+
+rule slam_model:
+    input:
+        bam=rules.alignment.output.primary, genomic=rules.grand3_reference.output, strand=rules.strand_selection.output,
+        code=code_for("slam_model")
+    output:
+        global_parameters=f'{OUT}/{{sample}}/05_slam_model/01_tables/{{sample}}.grand3_global_parameters.tsv',
+        genes=f'{OUT}/{{sample}}/05_slam_model/01_tables/{{sample}}.grand3_gene_ntr.tsv',
+        validation=f'{OUT}/{{sample}}/05_slam_model/05_metadata/grand3_validation.json'
+    params: settings=settings_for("slam_model")
+    log: f'{LOG}/{{sample}}/05_slam_model.log'
+    benchmark: f'{LOG}/{{sample}}/05_slam_model.benchmark.tsv'
+    threads: int(config.get('threads', 8))
+    resources: mem_mb=40960, sample_slots=1
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task slam_model --sample {wildcards.sample:q} --threads {threads} > {log:q} 2>&1'
+
+rule isoform_dynamics:
+    input:
+        calls=rules.read_calling.output.calls, assignments=rules.isoform_catalog.output.assignments,
+        catalog=rules.isoform_catalog.output.catalog,
+        global_parameters=rules.slam_model.output.global_parameters, genes=rules.slam_model.output.genes,
+        code=code_for("isoform_dynamics")
+    output:
+        isoforms=f'{OUT}/{{sample}}/06_isoform_dynamics/01_tables/{{sample}}.isoform_dynamics.tsv',
+        genes=f'{OUT}/{{sample}}/06_isoform_dynamics/01_tables/{{sample}}.gene_dynamics.tsv',
+        switches=f'{OUT}/{{sample}}/06_isoform_dynamics/01_tables/{{sample}}.isoform_switch_candidates.tsv',
+        validation=f'{OUT}/{{sample}}/06_isoform_dynamics/05_metadata/dynamics_validation.json'
+    params: settings=settings_for("isoform_dynamics")
+    log: f'{LOG}/{{sample}}/06_isoform_dynamics.log'
+    benchmark: f'{LOG}/{{sample}}/06_isoform_dynamics.benchmark.tsv'
+    threads: 1
+    resources: mem_mb=47104, sample_slots=1
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task isoform_dynamics --sample {wildcards.sample:q} > {log:q} 2>&1'
+
+rule annotate_sample_gene_names:
+    input:
+        tables=expand(SAMPLE_GENE_TABLES, sample=SAMPLES),
+        gtf=config['gtf'], script='pipeline/scripts/annotate_gene_name_tables.py', helper='pipeline/scripts/gene_annotation.py'
+    output: SAMPLE_GENE_NAME_VALIDATION
+    params: script='pipeline/scripts/annotate_gene_name_tables.py'
+    log: f'{LOG}/sample_gene_name_annotation.log'
+    threads: 1
+    resources: mem_mb=4096
+    shell: '{PY:q} {params.script:q} --gtf {input.gtf:q} --tables {input.tables:q} --validation {output:q} > {log:q} 2>&1'
+
+rule sample_report:
+    input:
+        raw_qc=rules.raw_qc.output, trim=rules.trim.output.summary,
+        flagstat=rules.alignment.output.flagstat, primary_flagstat=rules.alignment.output.primary_flagstat,
+        catalog=rules.isoform_catalog.output.catalog, catalog_validation=rules.isoform_catalog.output.validation,
+        model=rules.slam_model.output.validation, dynamics=rules.isoform_dynamics.output.validation,
+        isoforms=rules.isoform_dynamics.output.isoforms, switches=rules.isoform_dynamics.output.switches,
+        gene_names=rules.annotate_sample_gene_names.output,
+        substitutions=rules.read_calling.output.substitutions, caller_qc=rules.read_calling.output.qc,
+        code=code_for("sample_report")
+    output:
+        report=f'{OUT}/{{sample}}/07_sample_report/{{sample}}_report.html',
+        manifest=f'{OUT}/{{sample}}/07_sample_report/05_metadata/delivery_manifest.tsv',
+        validation=f'{OUT}/{{sample}}/07_sample_report/05_metadata/report_validation.json',
+        flow_html=f'{OUT}/{{sample}}/07_sample_report/04_tool_output/read_flow/reports/read_flow_sankey.html',
+        flow_section=f'{OUT}/{{sample}}/07_sample_report/04_tool_output/read_flow/reports/read_flow_sankey_section.html',
+        flow_validation=f'{OUT}/{{sample}}/07_sample_report/04_tool_output/read_flow/reports/sankey_validation.json',
+        flow_adapter_validation=f'{OUT}/{{sample}}/07_sample_report/04_tool_output/read_flow/reports/read_flow_adapter_validation.json',
+        flow_nodes=f'{OUT}/{{sample}}/07_sample_report/04_tool_output/read_flow/tables/read_flow_nodes.tsv',
+        flow_links=f'{OUT}/{{sample}}/07_sample_report/04_tool_output/read_flow/tables/read_flow_links.tsv'
+    params: settings=settings_for("sample_report")
+    log: f'{LOG}/{{sample}}/07_sample_report.log'
+    threads: 1
+    resources: mem_mb=4096, sample_slots=1
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task sample_report --sample {wildcards.sample:q} > {log:q} 2>&1'
+
+rule project_qc:
+    input:
+        expand(f'{OUT}/{{sample}}/07_sample_report/05_metadata/report_validation.json', sample=SAMPLES),
+        code=code_for("project_qc")
+    output: f'{OUT}/_project/08_project_qc/01_tables/sample_qc_summary.tsv'
+    params: settings=settings_for("project_qc")
+    log: f'{LOG}/project_qc.log'
+    threads: 1
+    resources: mem_mb=2048
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task project_qc > {log:q} 2>&1'
+
+rule group_analysis:
+    input:
+        qc=rules.project_qc.output,
+        isoforms=expand(f'{OUT}/{{sample}}/06_isoform_dynamics/01_tables/{{sample}}.isoform_dynamics.tsv', sample=SAMPLES),
+        genes=expand(f'{OUT}/{{sample}}/06_isoform_dynamics/01_tables/{{sample}}.gene_dynamics.tsv', sample=SAMPLES),
+        catalogs=expand(f'{OUT}/{{sample}}/04_isoform_catalog/01_tables/{{sample}}.isoform_catalog.tsv', sample=SAMPLES),
+        gene_names=rules.annotate_sample_gene_names.output,
+        code=code_for("group_analysis")
+    output:
+        group_validation=f'{GROUP_ROOT}/metadata/group_analysis_validation.json',
+        artifacts=GROUP_ARTIFACTS
+    params: settings=settings_for("group_analysis")
+    log: f'{LOG}/group_analysis.log'
+    benchmark: f'{LOG}/group_analysis.benchmark.tsv'
+    threads: 1
+    resources: mem_mb=16384
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task group_analysis > {log:q} 2>&1'
+
+rule new_rna_splicing:
+    input:
+        group=rules.group_analysis.output,
+        dynamics=expand(f'{OUT}/{{sample}}/06_isoform_dynamics/01_tables/{{sample}}.isoform_dynamics.tsv', sample=SAMPLES),
+        catalog=expand(f'{OUT}/{{sample}}/04_isoform_catalog/01_tables/{{sample}}.isoform_catalog.tsv', sample=SAMPLES),
+        gtf=config['gtf'], samples=SAMPLE_SHEET, code=code_for('new_rna_splicing')
+    output: validation=f'{GROUP_ROOT}/tables/differential/new_rna_splicing/new_rna_splicing_validation.json'
+    params: settings=settings_for('new_rna_splicing')
+    log: f'{LOG}/new_rna_splicing.log'
+    benchmark: f'{LOG}/new_rna_splicing.benchmark.tsv'
+    threads: 1
+    resources: mem_mb=8192
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task new_rna_splicing > {log:q} 2>&1'
+
+rule annotate_as_gene_names:
+    input:
+        validation=rules.new_rna_splicing.output.validation,
+        tables=[f'{GROUP_ROOT}/tables/differential/new_rna_splicing/differential_new_rna_splicing.tsv',
+                f'{GROUP_ROOT}/tables/differential/new_rna_splicing/sample_event_psi.tsv',
+                f'{GROUP_ROOT}/tables/differential/new_rna_splicing/novel_structure_inventory.tsv'],
+        gtf=config['gtf'], script='pipeline/scripts/annotate_gene_name_tables.py', helper='pipeline/scripts/gene_annotation.py'
+    output: AS_GENE_NAME_VALIDATION
+    params: script='pipeline/scripts/annotate_gene_name_tables.py'
+    log: f'{LOG}/as_gene_name_annotation.log'
+    threads: 1
+    resources: mem_mb=4096
+    shell: '{PY:q} {params.script:q} --gtf {input.gtf:q} --tables {input.tables:q} --validation {output:q} > {log:q} 2>&1'
+
+rule project_report:
+    input:
+        qc=rules.project_qc.output, group=rules.group_analysis.output, splicing=rules.new_rna_splicing.output.validation,
+        splicing_gene_names=rules.annotate_as_gene_names.output,
+        code=code_for("project_report")
+    output:
+        report=f'{OUT}/_project/09_project_report/report.html',
+        review_table=f'{OUT}/_project/09_project_report/01_tables/sample_qc_review.tsv',
+        manifest=f'{OUT}/_project/09_project_report/05_metadata/delivery_manifest.tsv',
+        validation=f'{OUT}/_project/09_project_report/05_metadata/report_validation.json'
+    params: settings=settings_for("project_report")
+    log: f'{LOG}/project_report.log'
+    threads: 1
+    resources: mem_mb=4096
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task project_report > {log:q} 2>&1'
+
+rule delivery:
+    input:
+        project=rules.project_report.output.validation,
+        samples=expand(f'{OUT}/{{sample}}/07_sample_report/05_metadata/report_validation.json', sample=SAMPLES),
+        code=code_for("delivery")
+    output:
+        complete=f'{OUT}/_project/RUN_COMPLETE.tsv',
+        manifest=f'{OUT}/delivery_manifest.tsv'
+    params: settings=settings_for("delivery")
+    log: f'{LOG}/delivery.log'
+    threads: 1
+    resources: mem_mb=2048
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task delivery > {log:q} 2>&1'
+
+rule customer_delivery:
+    input:
+        complete=rules.delivery.output.complete,
+        report=rules.project_report.output.report,
+        review_table=rules.project_report.output.review_table,
+        code=code_for("customer_delivery")
+    output:
+        validation=f'{CUSTOMER_DELIVERY}/DELIVERY_VALIDATION.json',
+        manifest=f'{CUSTOMER_DELIVERY}/delivery_manifest.tsv'
+    params: settings=settings_for("customer_delivery")
+    log: f'{LOG}/customer_delivery.log'
+    threads: 1
+    resources: mem_mb=2048
+    shell: '{PY:q} {TASK:q} --config {CONFIG:q} --task customer_delivery > {log:q} 2>&1'

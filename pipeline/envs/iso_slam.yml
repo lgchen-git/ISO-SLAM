@@ -1,0 +1,15 @@
+name: iso_slam
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11.15
+  - minimap2=2.31
+  - samtools=1.23.1
+  - nanoplot=1.47.1
+  - pysam=0.24.0
+  - scipy=1.17.1
+  - pyyaml=6.0.3
+  - r-base=4.3.3
+  - bioconductor-edger=4.0.16
